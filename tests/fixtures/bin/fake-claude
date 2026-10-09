@@ -1,0 +1,15 @@
+#!/usr/bin/env node
+// Stands in for `claude -p --output-format json --json-schema ...` in tests.
+const args = process.argv.slice(2);
+let input = '';
+process.stdin.on('data', (d) => (input += d));
+process.stdin.on('end', () => {
+  const mode = process.env.FAKE_CLAUDE_MODE ?? 'ok';
+  if (!args.includes('--json-schema') || !args.includes('-p') || args[args.indexOf('--tools') + 1] !== '') { console.log(JSON.stringify({ is_error: true, result: 'bad args' })); return; }
+  if (mode === 'auth') { console.log(JSON.stringify({ type: 'result', is_error: true, result: 'Failed to authenticate' })); return; }
+  const destructive = /DATA LOSS|drop/i.test(input);
+  const out = mode === 'garbage'
+    ? { risk: 'NOPE' }
+    : { risk: destructive ? 'CRITICAL' : 'LOW', confidence: 0.95, destructive, summary: 'fake', consequences: [], intentAlignment: 'no_intent', recommendedAction: { type: destructive ? 'NONE' : 'ACCEPT_DEFAULT', optionIndex: null }, reason: 'fake reason' };
+  console.log(JSON.stringify({ type: 'result', is_error: false, structured_output: out, usage: { input_tokens: 100, output_tokens: 20 }, total_cost_usd: 0.0012 }));
+});

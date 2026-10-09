@@ -1,0 +1,16 @@
+{
+  "name": "@ttysage/decision-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.5",
+    "@ttysage/pty": "workspace:*",
+    "@ttysage/prompt-understanding": "workspace:*",
+    "@ttysage/safety": "workspace:*"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "ttysage",
+  "version": "0.1.0",
+  "description": "Intelligent interactive terminal layer for AI coding agents",
+  "type": "module",
+  "bin": {
+    "ttysage": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsup"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.132.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@ttysage/approval": "workspace:*",
+    "@ttysage/audit": "workspace:*",
+    "@ttysage/core": "workspace:*",
+    "@ttysage/mcp-server": "workspace:*",
+    "@ttysage/prompt-understanding": "workspace:*",
+    "@ttysage/safety": "workspace:*",
+    "@xterm/headless": "6.0.0",
+    "node-pty": "1.1.0",
+    "zod": "4.6.5"
+  },
+  "license": "MIT",
+  "author": "Masih Moloodian <masihmoloodian@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/masihmoloodian/ttysage.git"
+  },
+  "homepage": "https://masihmoloodian.github.io/ttysage/"
+}

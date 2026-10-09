@@ -1,0 +1,10 @@
+datasource db {
+  provider = "sqlite"
+}
+
+// v2: drop legacyEmail, add email
+model User {
+  id    Int     @id @default(autoincrement())
+  name  String
+  email String?
+}

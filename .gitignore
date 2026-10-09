@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.ttysage/
+*.log
+examples/**/node_modules/
+examples/**/*.db
+examples/**/.terraform/
+examples/**/terraform.tfstate*
+examples/prisma/prisma/migrations/

@@ -1,0 +1,8 @@
+{
+  "name": "ttysage-demo-prisma",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "prisma": "7.10.0"
+  }
+}

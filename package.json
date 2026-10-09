@@ -1,0 +1,51 @@
+{
+  "name": "ttysage-monorepo",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter \"./apps/*\" build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "bench": "tsx tests/benchmark/run.ts",
+    "ttysage": "tsx apps/cli/src/main.ts",
+    "test:real": "TTYSAGE_REAL_TOOLS=1 vitest run tests/real-tools"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "node-pty",
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@clack/prompts": "^1.8.1",
+    "@inquirer/prompts": "^8.7.3",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@ttysage/approval": "workspace:*",
+    "@ttysage/audit": "workspace:*",
+    "@ttysage/core": "workspace:*",
+    "@ttysage/decision-engine": "workspace:*",
+    "@ttysage/detector": "workspace:*",
+    "@ttysage/prompt-understanding": "workspace:*",
+    "@ttysage/pty": "workspace:*",
+    "@ttysage/safety": "workspace:*",
+    "@ttysage/terminal": "workspace:*",
+    "@types/node": "22",
+    "enquirer": "^2.4.1",
+    "prompts": "^2.4.2",
+    "tsup": "8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  },
+  "license": "MIT",
+  "author": "Masih Moloodian <masihmoloodian@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/masihmoloodian/ttysage.git"
+  },
+  "homepage": "https://masihmoloodian.github.io/ttysage/"
+}

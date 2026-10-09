@@ -1,0 +1,13 @@
+{
+  "name": "ttysage-demo-drizzle",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "reset": "node reset.mjs"
+  },
+  "devDependencies": {
+    "drizzle-kit": "0.31.11",
+    "drizzle-orm": "0.45.3",
+    "@libsql/client": "0.18.0"
+  }
+}
