@@ -35,8 +35,10 @@ export interface InteractionAudit {
   injection: boolean;
   intentMismatch: boolean;
   llmUsed: boolean;
-  /** Who resolved it: auto | human | agent | takeover | cancel | deny */
+  /** Who resolved it: auto | human | agent | takeover | superseded | cancel | deny */
   resolvedBy: string;
+  /** Approval mode in force, when not the default "human" (agent-high | bypass). */
+  approvalMode?: string;
   humanDecision?: string;
   /** Description of what was sent (secrets never included). */
   answerSent: string | null;

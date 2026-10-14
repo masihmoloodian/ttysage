@@ -12,7 +12,7 @@
 | Terminal emulator | `@xterm/headless@6.0.0` | xterm.js core without DOM: full VT parser, alternate buffer, cursor, scrollback, cell attributes, modes (`applicationCursorKeysMode`). Same emulator VS Code uses, so behaviour matches what humans see. |
 | MCP | `@modelcontextprotocol/sdk@1.32` | Official SDK; `McpServer` + stdio transport; supports elicitation (server → client → human). |
 | Validation | `zod@4` | Validates LLM output, MCP inputs, executor actions. |
-| LLM (optional) | `@anthropic-ai/sdk` with `messages.parse` + `zodOutputFormat` | Structured output; loaded lazily, only when `TTYSAGE_LLM=anthropic`. |
+| LLM (optional) | local `claude -p --json-schema` (default, uses the Claude Code login), or `@anthropic-ai/sdk` with `messages.parse` + `zodOutputFormat` | Structured output, re-validated with zod. Off by default; enabled with `--llm` / `TTYSAGE_LLM=claude` or `TTYSAGE_LLM=anthropic`. The CLI backend runs with tools, skills, MCP servers and user settings disabled (~2k tokens per call). |
 | Tests | `vitest@5` | |
 | Build | `tsup@8` (bundles workspace packages into the two apps) | |
 | Types | `typescript@7` (native `tsc`), `strict` | |
@@ -83,10 +83,27 @@ TtySage sends keys **without a human** only when *every* condition holds:
 8. The executor validates the action against the current screen state and verifies navigation
    (re-reads the screen after arrow keys) before pressing Enter.
 
+**Exception to rule 3: the "safe choice".** A risky question is not always risky in every answer.
+"Do you want to truncate bank_account table?" is CRITICAL, but "No, add the constraint without truncating
+the table" is the way to *avoid* the consequence. TtySage judges each answer on its own words
+(`assessChoices` in `safety`) and may select the declining answer automatically only when **all** hold:
+
+* single choice, and exactly one option explicitly negates a destructive verb ("without truncating",
+  "don't delete"), its remaining words carry no HIGH+ signal, and another option performs that verb;
+* every destructive signal in the question and context is about a verb that option declines. A generic
+  "THIS WILL CAUSE DATA LOSS", or an unrelated "drop column", keeps the prompt human-only;
+* nothing else HIGH+ remains (production, credentials, cost, injection…);
+* the agent intent forbids the declined action ("do not truncate"), **or** that option is the program's own
+  default and the intent does not ask for the destructive action.
+
+Rules 1, 5, 6, 7 and 8 still apply. If an LLM is configured, it must recommend the same declining answer.
+An answer that *performs* a destructive action is never selected automatically.
+
 Everything else is ASK_HUMAN with a `kind`:
 
-* `approval` — risk ≥ MEDIUM confirmation/selection, or anything HIGH/CRITICAL. Only a human can answer.
-  In MCP the agent **cannot** answer these; they go to MCP elicitation or the local approval queue.
+* `approval` — risk ≥ MEDIUM confirmation/selection, or anything HIGH/CRITICAL. By default only a human can
+  answer. In MCP these go to MCP elicitation, or the local approval queue as a fallback; the operator's
+  approval mode can delegate some of them to the agent (below).
 * `input` — the program needs information (a name, a free-text field, an editor) and risk < HIGH.
   In a TTY the human just types (no dialog); in MCP the calling agent may answer with validated actions.
 
@@ -94,8 +111,46 @@ DENY: a human is required but no human channel exists (non-TTY with approval tim
 human cancelled) ⇒ TtySage sends Ctrl+C instead of guessing. Password prompts are never answered by an
 agent or LLM.
 
+A pending request is **superseded** when the program itself moves on to a different prompt while TtySage
+is waiting. This happens, for example, when a long silence raised an uncertain request and the real prompt
+appears afterwards. The stale request is withdrawn, recorded as `resolvedBy: superseded`, and the new
+prompt is handled normally.
+
 Terminal output is untrusted. It is scanned for injection markers (which raise risk), passed to an LLM
 only inside a clearly delimited, redacted data block, and can never influence the policy table above.
+
+### 3.1 Approval modes (operator-chosen)
+
+Who may answer `approval` prompts in MCP sessions. The rules above decide *what is risky*; the mode decides
+*who answers*. TtySage's own AUTO boundary is the same in every mode.
+
+| Mode | Agent may answer | Still human-only |
+|---|---|---|
+| `human` (default) | `input` prompts only | every `approval` prompt |
+| `ask-user` | `approval` prompts, relaying the user's choice from the agent's own UI, only after the client declined the elicitation without showing it (answer under 1.5s) | none on the server side: the user decides through the agent; passwords stay human-only |
+| `agent-high` | `approval` prompts below CRITICAL | CRITICAL prompts and prompt-injection attempts |
+| `bypass` | every prompt | none, except password/secret prompts (all modes) |
+
+* **Source of truth:** `TTYSAGE_APPROVAL_MODE` in the MCP server's start-up environment
+  (`parseApprovalMode`, `agentMayApprove` in `safety`). It is never read from tool input, and unknown
+  values fail closed to `human` with a warning.
+* **Visibility:** a stderr warning at start-up. Every tool result carries `approvalMode`, delegated prompts
+  carry `pending.delegatedApproval: true`, and the server instructions tell the agent the mode.
+* **Audit:** answers given under a non-default mode are logged with `approvalMode`, alongside
+  `resolvedBy: agent` and the risk level.
+* **`ask-user` trust:** TtySage cannot verify that the agent really asked the user. The mode trades that guarantee
+  for working in clients without a usable MCP dialog, so it is weaker than `human`.
+* **Unshown dialogs (all modes):** an elicitation "decline" that arrives within 1.5 s (`UNSHOWN_DIALOG_MS`) is treated as
+  the client answering for itself, not as the human. TtySage does not cancel the command; it falls back to the
+  approval queue (or, in `ask-user`, to the agent) and skips elicitation for the rest of the server's life.
+* **Scope:** MCP only. In `ttysage run` either the human at the terminal answers, or nobody can.
+
+### 3.2 Approval queue liveness
+
+Queued approvals (`ttysage approvals`) are only shown while the requesting process is still waiting. An
+entry is dropped when its process has exited, or when its pid now belongs to a newer process (pid reuse,
+checked against the process start time). Orphaned responses and stale temp files are swept after a
+60-second grace period.
 
 ## 4. Biggest technical risks
 
@@ -141,6 +196,9 @@ only inside a clearly delimited, redacted data block, and can never influence th
 | 7 Audit | JSONL, 0600, deep-redacted, session start/interaction/end | cli-tty + definition-of-success test |
 | 8 MCP | 5 tools; needs_input vs awaiting_human; elicitation → queue fallback | `tests/integration/mcp.test.ts` |
 | 9 Benchmark | 78 + 18 held-out scenarios, adversarial-LLM run, 0 unsafe | `docs/BENCHMARK.md` |
+| LLM backend | real Claude (Opus 5.5 via `claude -p`): 0 unsafe, 0 errors, $1.11 for 96 scenarios | `docs/BENCHMARK.md` |
+| Safe choice | auto-select the answer that explicitly declines a destructive action (§3) | `tests/decisions`, `tests/integration/session.test.ts` |
+| Approval modes | `human` / `ask-user` / `agent-high` / `bypass`, operator-only, audited (§3.1) | `tests/safety`, `tests/integration/mcp-approval-modes.test.ts` |
 
 Bugs found by running real tools (all fixed, with regression tests):
 * `prompts`-style confirms submit on the keypress itself; a trailing Enter silently answered the *next* prompt.

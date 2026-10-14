@@ -13,7 +13,7 @@ import { executeAction, validateAction, type ExecutionResult } from './executor'
 // Human channel: how a session reaches whoever can answer (TTY human, MCP agent, approval queue).
 // ---------------------------------------------------------------------------
 
-export type ResolvedBy = 'auto' | 'human' | 'agent' | 'takeover' | 'cancel' | 'deny';
+export type ResolvedBy = 'auto' | 'human' | 'agent' | 'takeover' | 'superseded' | 'cancel' | 'deny';
 
 export type Resolution =
   /** Send this (validated) action. */
@@ -73,6 +73,8 @@ export interface SessionOptions {
   quiescenceMs?: number;
   /** Free-form label for audit ("cli-tty", "mcp", ...). */
   mode?: string;
+  /** Operator-chosen approval mode, recorded on every interaction in the audit log. */
+  approvalMode?: string;
 }
 
 export interface SessionResult {
@@ -324,7 +326,8 @@ export class Session extends EventEmitter<SessionEvents> {
       };
       this.emit('request', req);
       // If the screen changes to a different prompt (e.g. a human typed in the terminal), stop waiting.
-      const watcher = this.watchPromptGone(key, abort);
+      const gone = { byProgram: false };
+      const watcher = this.watchPromptGone(key, abort, gone);
       try {
         resolution = await channel.request(req);
       } catch (err) {
@@ -332,7 +335,7 @@ export class Session extends EventEmitter<SessionEvents> {
       } finally {
         watcher();
       }
-      resolvedBy = resolution.type === 'takeover' ? 'takeover' : resolution.type === 'cancel' ? 'cancel' : resolution.by;
+      resolvedBy = resolution.type === 'takeover' ? (gone.byProgram ? 'superseded' : 'takeover') : resolution.type === 'cancel' ? 'cancel' : resolution.by;
     }
     if (this.exited) return;
 
@@ -370,17 +373,23 @@ export class Session extends EventEmitter<SessionEvents> {
     this.record(id, prompt, decision, resolvedBy, answer, executed, Date.now() - started);
   }
 
-  private watchPromptGone(key: string, abort: AbortController): () => void {
+  private watchPromptGone(key: string, abort: AbortController, gone: { byProgram: boolean } = { byProgram: false }): () => void {
     let stopped = false;
+    const raisedAt = Date.now();
     const tick = async (): Promise<void> => {
       while (!stopped && !abort.signal.aborted && !this.exited) {
         await sleep(400);
         if (stopped) return;
-        if (Date.now() - this.lastHumanInputAt > 5000) continue; // only react to human activity
+        // React to human keystrokes, or to the program itself moving on: a long silence (e.g. a slow
+        // "Pulling schema..." step) can raise an uncertain request, and when output resumes with the real
+        // prompt the stale request must be withdrawn, or the session waits forever on the wrong question.
+        const humanActive = Date.now() - this.lastHumanInputAt <= 5000;
+        const programMovedOn = this.lastOutputAt > raisedAt;
+        if (!humanActive && !programMovedOn) continue;
         const { detection, prompt } = await this.currentPrompt();
         if (detection.interactive === false && detection.signals.includes('awaiting-stability')) continue;
         const k = prompt ? `${prompt.fingerprint}@${prompt.anchorLine}` : null;
-        if (k !== key) { abort.abort(); return; }
+        if (k !== key) { gone.byProgram = !humanActive; abort.abort(); return; }
       }
     };
     void tick();
@@ -454,6 +463,7 @@ export class Session extends EventEmitter<SessionEvents> {
       intentMismatch: decision.intentMismatch,
       llmUsed: decision.llm?.used === true,
       resolvedBy,
+      ...(this.opts.approvalMode && this.opts.approvalMode !== 'human' ? { approvalMode: this.opts.approvalMode } : {}),
       ...(resolvedBy === 'human' ? { humanDecision: answer ?? undefined } : {}),
       answerSent: answer,
       executed: executed?.ok ?? false,

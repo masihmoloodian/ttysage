@@ -213,6 +213,107 @@ export function intentMismatch(intent: string | undefined, signals: RiskSignal[]
 }
 
 // ---------------------------------------------------------------------------
+// Per-choice risk. A question like "Do you want to truncate the table?" is CRITICAL as a whole, but
+// its answers are not equally dangerous: "No, add the constraint without truncating the table" is the
+// way to *avoid* the consequence. These helpers judge each choice on its own words.
+// ---------------------------------------------------------------------------
+
+/** Roots of destructive verbs, used to tie a declining choice to the action it declines. */
+const DESTRUCTIVE_ROOTS = ['truncat', 'drop', 'delet', 'remov', 'wip', 'purg', 'eras', 'destr', 'overwrit', 'reset', 'discard', 'nuke'] as const;
+const DESTRUCTIVE_WORD = `(?:${DESTRUCTIVE_ROOTS.join('|')})\\w*`;
+/**
+ * A negation directly governing a destructive verb: "without truncating", "do not drop or truncate",
+ * "don't delete", "will not be removed". Deliberately tight: only "X or/and" may sit in between, and
+ * punctuation breaks the phrase ("Don't wait, delete it" is NOT a negation of delete).
+ */
+const NEGATED_DESTRUCTIVE = new RegExp(
+  `\\b(?:without|not|never|no|don'?t|dont|avoid(?:ing)?|skip(?:ping)?)\\s+(?:be\\s+)?((?:${DESTRUCTIVE_WORD})(?:\\s+(?:or|and|nor)\\s+${DESTRUCTIVE_WORD})*)\\b`,
+  'gi',
+);
+
+export function destructiveRoot(word: string): string | null {
+  const w = word.toLowerCase();
+  return DESTRUCTIVE_ROOTS.find((r) => w.startsWith(r)) ?? null;
+}
+
+function rootsIn(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const w of text.match(/[a-z']+/gi) ?? []) {
+    const r = destructiveRoot(w);
+    if (r) out.add(r);
+  }
+  return out;
+}
+
+/** The destructive roots a text explicitly negates, and the text with those phrases removed. */
+export function negatedDestructive(text: string): { roots: Set<string>; remainder: string } {
+  const roots = new Set<string>();
+  const remainder = text.replace(NEGATED_DESTRUCTIVE, (_m, verbs: string) => {
+    for (const r of rootsIn(verbs)) roots.add(r);
+    return ' ';
+  });
+  return { roots, remainder };
+}
+
+export interface ChoiceAssessment {
+  index: number;
+  /** Risk of the choice's own words once explicitly negated consequences are removed. */
+  level: RiskLevel;
+  /** The choice itself performs a destructive action (un-negated). */
+  destructive: boolean;
+  /** Destructive roots the choice performs. */
+  performs: string[];
+  /** Destructive roots the choice explicitly declines ("without truncating" ⇒ truncat). */
+  declines: string[];
+  signals: RiskSignal[];
+}
+
+export function assessChoices(labels: string[]): ChoiceAssessment[] {
+  return labels.map((label, index) => {
+    const { roots, remainder } = negatedDestructive(label);
+    const signals: RiskSignal[] = [];
+    scanText(remainder, 'option', signals);
+    let level: RiskLevel = 'LOW';
+    for (const s of signals) if (riskRank(s.level) > riskRank(level)) level = s.level;
+    const destructive = isDestructive(signals);
+    const performs = destructive ? [...rootsIn(remainder)] : [];
+    return { index, level, destructive, performs, declines: [...roots], signals };
+  });
+}
+
+/** The intent explicitly forbids one of these destructive actions ("do not drop or truncate data"). */
+export function intentForbids(intent: string | undefined, roots: Iterable<string>): boolean {
+  if (!intent) return false;
+  const neg = negatedDestructive(intent).roots;
+  for (const r of roots) if (neg.has(r)) return true;
+  return false;
+}
+
+/**
+ * A destructive word naming a prompt rather than asking for the action: "truncate prompts must be
+ * answered No", "the drop warning". It describes what the program will ask, not what to do.
+ */
+const DESTRUCTIVE_MENTION = new RegExp(
+  `\\b${DESTRUCTIVE_WORD}(?:\\s+(?:table|column|data))?\\s+(?:prompts?|questions?|confirmations?|warnings?|dialogs?)\\b`,
+  'gi',
+);
+
+/** The intent asks (un-negated) for one of these destructive actions ("truncate the table"). */
+export function intentRequests(intent: string | undefined, roots: Iterable<string>): boolean {
+  if (!intent) return false;
+  const asked = rootsIn(negatedDestructive(intent).remainder.replace(DESTRUCTIVE_MENTION, ' '));
+  for (const r of roots) if (asked.has(r)) return true;
+  return false;
+}
+
+/** Destructive roots mentioned by a signal's match ("will be truncated" ⇒ truncat). */
+export function signalRoots(s: RiskSignal): string[] {
+  return [...rootsIn(s.match)];
+}
+
+export { DESTRUCTIVE_CATEGORIES };
+
+// ---------------------------------------------------------------------------
 // Redaction
 // ---------------------------------------------------------------------------
 
@@ -273,3 +374,47 @@ export const POLICY = {
   /** Risk at or above which only a human may answer. */
   humanOnlyRisk: 'HIGH' as RiskLevel,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Approval modes (trusted, operator-chosen): who may answer prompts the policy marks ASK_HUMAN.
+// Set ONLY by the person running TtySage (server start-up config). Nothing the agent sends and
+// nothing a program prints can change it.
+// ---------------------------------------------------------------------------
+
+export const APPROVAL_MODES = ['human', 'ask-user', 'agent-high', 'bypass'] as const;
+export type ApprovalMode = (typeof APPROVAL_MODES)[number];
+
+export const APPROVAL_MODE_DESCRIPTIONS: Record<ApprovalMode, string> = {
+  human: 'Risky prompts wait for a human (default).',
+  'ask-user': 'Risky prompts go to a human: a client dialog when the client shows one, otherwise the agent must ask the user in its own UI and relay their exact choice.',
+  'agent-high': 'The agent may answer HIGH-risk prompts. CRITICAL prompts and prompt-injection attempts still wait for a human.',
+  bypass: 'The agent may answer every prompt except password/secret prompts. No human approval.',
+};
+
+/** Parse an operator setting. Unknown values fail closed to "human". */
+export function parseApprovalMode(value: string | undefined): { mode: ApprovalMode; warning?: string } {
+  const v = (value ?? '').trim().toLowerCase();
+  if (!v) return { mode: 'human' };
+  if ((APPROVAL_MODES as readonly string[]).includes(v)) return { mode: v as ApprovalMode };
+  return { mode: 'human', warning: `Unknown approval mode "${value}"; using "human". Valid: ${APPROVAL_MODES.join(', ')}.` };
+}
+
+/**
+ * May the agent answer a prompt that would otherwise need a human? Secrets are never agent-answerable,
+ * in any mode: an agent has no legitimate source for your password, and typing one would put it in the
+ * agent's context and logs.
+ */
+export function agentMayApprove(
+  mode: ApprovalMode,
+  decision: { risk: RiskOrUnknown; injection: boolean },
+  promptType: string,
+): boolean {
+  if (promptType === 'password') return false;
+  switch (mode) {
+    case 'human': return false;
+    // The agent may only relay the user's answer, after the client dialog was not shown (see the MCP server).
+    case 'ask-user': return false;
+    case 'agent-high': return !decision.injection && riskRank(decision.risk) < riskRank('CRITICAL');
+    case 'bypass': return true;
+  }
+}

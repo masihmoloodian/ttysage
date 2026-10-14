@@ -27,7 +27,8 @@ Run options:
   --json                   Print a JSON summary to stderr when done
   -q, --quiet              No TtySage notices
 
-Environment: TTYSAGE_HOME (default ~/.ttysage), TTYSAGE_AUDIT=off, TTYSAGE_LLM=claude|anthropic, TTYSAGE_LLM_MODEL, TTYSAGE_CLAUDE_BIN.`;
+Environment: TTYSAGE_HOME (default ~/.ttysage), TTYSAGE_AUDIT=off, TTYSAGE_LLM=claude|anthropic, TTYSAGE_LLM_MODEL, TTYSAGE_CLAUDE_BIN.
+MCP only: TTYSAGE_APPROVAL_MODE=human|ask-user|agent-high|bypass (who may answer risky prompts; default human).`;
 
 const C = { dim: '\x1b[2m', bold: '\x1b[1m', reset: '\x1b[0m', yellow: '\x1b[33m', red: '\x1b[31m', cyan: '\x1b[36m', green: '\x1b[32m' };
 

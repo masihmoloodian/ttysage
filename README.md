@@ -134,6 +134,38 @@ Actions form a closed set: `ACCEPT_DEFAULT`, `SELECT_OPTION`, `SELECT_OPTIONS`, 
 names only), and `CANCEL`. The executor checks every action against the current screen before sending keys. For example,
 it moves one arrow key at a time, re-reads the screen, and only presses Enter on the option it has confirmed is selected.
 
+### Approval modes (who may answer risky prompts)
+
+By default you approve every risky prompt. If you want the agent to work without stopping, choose a mode when you
+add the server. This works like Claude Code's own permission modes.
+
+| Mode | The agent may answer | Still waits for you |
+|---|---|---|
+| `human` (default) | ordinary input only | every risky prompt |
+| `ask-user` | only what you pick: when your client shows no approval dialog (e.g. Claude Code in bypass-permissions mode declines it unseen), the agent asks you in its own UI and relays your exact choice | every risky prompt, decided by you in the agent's UI |
+| `agent-high` | HIGH-risk prompts (schema changes, deploys, new SSH host keys…) | CRITICAL prompts (data loss, destroy, irreversible) and prompt-injection attempts |
+| `bypass` | everything | nothing, except passwords and secrets, which an agent can never type |
+
+```bash
+claude mcp add ttysage -e TTYSAGE_APPROVAL_MODE=agent-high -- node ~/ttysage/apps/mcp/dist/main.js
+```
+
+- **Only you can set it.** The mode is read from the server's start-up environment. No tool call can change it, and a
+  misspelled value falls back to `human`.
+- **The agent knows.** Delegated prompts arrive as `needs_input` with `pending.delegatedApproval: true`, and every tool
+  result shows `approvalMode`.
+- **It's recorded.** Each answer the agent gives is logged in `ttysage audit` with `resolvedBy: agent`, the mode, and
+  the risk level.
+- **`ask-user` relies on the agent.** TtySage can't check that the agent really asked you, so use it with agents you
+  trust. With `human`, TtySage asks you itself.
+- **Silent clients.** If a client "declines" TtySage's dialog instantly (in under 1.5 s), TtySage assumes no dialog was
+  shown, falls back to `ttysage approvals` (or, in `ask-user`, to the agent), and stops using that client's dialog.
+- **TtySage still never guesses.** The modes only change *who* may answer. TtySage's own automatic answers stay limited
+  to low-risk defaults.
+
+Use `bypass` only in disposable environments (containers, scratch databases, CI sandboxes), as you would Claude Code's
+bypass mode.
+
 ## How it works
 
 ```
@@ -151,6 +183,11 @@ or text mode; no risk signal anywhere in the command, the question, the options,
 injection markers; an answer that is the program's default or named by the agent's intent; no recent human keystrokes;
 and, if an LLM is configured, its agreement. Passwords are never typed by automation. Terminal output is treated as
 untrusted throughout: when it is passed to an LLM it goes in a delimited data block, and it never changes the policy.
+
+One narrow exception: when a risky question offers exactly one answer that explicitly *declines* the danger (e.g.
+"No, add the constraint **without truncating** the table"), TtySage may pick that answer, but only if your intent
+forbids the action or it is the program's own default. An answer that *performs* a destructive action is never picked
+automatically. Full rules: [docs/ARCHITECTURE.md §3](docs/ARCHITECTURE.md).
 
 **Optional LLM.** `--llm` (or `TTYSAGE_LLM=claude`) adds a Claude second opinion through your local `claude` CLI login,
 so no API key is needed. `TTYSAGE_LLM=anthropic` uses the API SDK instead. The default model is `claude-opus-5-5`

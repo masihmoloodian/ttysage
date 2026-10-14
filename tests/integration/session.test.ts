@@ -115,4 +115,40 @@ describe('Session (real PTY, real prompt libraries)', () => {
     expect(channel.requests.map((r) => r.prompt.type)).toEqual(['confirmation', 'text']);
     expect(resultOf(result.output)).toEqual({ ok: true, name: 'from-agent' });
   });
+
+  it('a request raised during a long silence is withdrawn when the program moves on to the real prompt', async () => {
+    // Like `drizzle-kit push`: a slow, silent step ("Pulling schema...") then the real question.
+    const { result, channel } = await runScripted('echo "Reading config file x"; sleep 4; ./yn.sh', (req, i) => {
+      expect(i).toBe(0); // the real [Y/n] prompt is auto-accepted, never routed to this stale request
+      return new Promise<Resolution>((resolve) => {
+        req.signal.addEventListener('abort', () => resolve({ type: 'takeover' }), { once: true });
+      });
+    }, { timeoutMs: 15_000 });
+    expect(channel.requests).toHaveLength(1);
+    expect(channel.requests[0]!.prompt.question).toContain('Reading config file');
+    expect(result.output).toContain('RESULT default');
+    expect(result.exitCode).toBe(0);
+    expect(result.interactions.map((i) => i.resolvedBy)).toEqual(['superseded', 'auto']);
+  });
+  it('truncate prompt: the declining choice is auto-selected when the intent forbids truncation', async () => {
+    const { result, channel } = await runScripted('node truncate-constraint.mjs', fail, {
+      intent: 'apply the schema; do not rename; do not drop or truncate data',
+    });
+    expect(channel.requests).toHaveLength(0);
+    expect(result.output).toContain('RESULT keep');
+    expect(result.exitCode).toBe(0);
+    expect(result.interactions[0]!.resolvedBy).toBe('auto');
+    expect(result.interactions[0]!.answer).toContain('without truncating');
+  });
+
+  it('truncate prompt: still escalated when the only way forward is the truncate choice', async () => {
+    const { result, channel } = await runScripted('node truncate-constraint.mjs only-truncate', (req) => {
+      expect(req.decision.decision).toBe('ASK_HUMAN');
+      expect(req.decision.kind).toBe('approval');
+      expect(req.decision.risk).toBe('CRITICAL');
+      return { type: 'action', action: { type: 'SELECT_OPTION', optionIndex: 1 }, by: 'human' };
+    }, { intent: 'apply the schema; do not drop or truncate data' });
+    expect(channel.requests).toHaveLength(1);
+    expect(result.output).toContain('RESULT abort');
+  });
 });

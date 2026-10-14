@@ -5,13 +5,19 @@ import {
 } from '@ttysage/core';
 import { ApprovalQueue, QueueChannel, buildChoices, type Choice } from '@ttysage/approval';
 import { AuditLogger, ttysageHome } from '@ttysage/audit';
-import { riskRank, POLICY } from '@ttysage/safety';
+import { riskRank, POLICY, agentMayApprove, type ApprovalMode } from '@ttysage/safety';
 import { interpreterFromEnv } from '@ttysage/prompt-understanding';
 
 /**
  * Agent-facing session manager. Transport-agnostic: MCP is one adapter over it; an HTTP or SDK adapter
  * would reuse it unchanged.
  */
+
+/**
+ * A client answer to an approval dialog faster than this was not given by a person: the client
+ * declined without showing a dialog (e.g. Claude Code in bypass-permissions mode).
+ */
+export const UNSHOWN_DIALOG_MS = 1500;
 
 export type AgentStatus = 'running' | 'needs_input' | 'awaiting_human' | 'blocked' | 'completed';
 
@@ -25,6 +31,10 @@ interface Pending {
   resolve?: (r: Resolution) => void;
   approvalId?: string;
   message: string;
+  /** A human-level approval handed to the agent by the operator's approval mode. */
+  delegated?: boolean;
+  /** Approval mode "ask-user": the agent must ask the user in its own UI and relay their exact choice. */
+  askUser?: boolean;
 }
 
 export interface StartOptions {
@@ -53,6 +63,7 @@ export class ManagedSession implements HumanChannel {
     private readonly askHuman: HumanAsker | null,
     queue: ApprovalQueue,
     audit: AuditLogger,
+    readonly approvalMode: ApprovalMode = 'human',
   ) {
     this.queueChannel = new QueueChannel({
       queue,
@@ -71,7 +82,8 @@ export class ManagedSession implements HumanChannel {
       channel: this,
       interpreter: interpreterFromEnv(),
       audit,
-      mode: 'mcp',
+      mode: approvalMode === 'human' ? 'mcp' : `mcp (approval mode: ${approvalMode})`,
+      approvalMode,
     });
     this.session.on('interaction', () => this.notify());
     this.session.on('exit', (r) => {
@@ -97,13 +109,33 @@ export class ManagedSession implements HumanChannel {
     if (!needsHuman) {
       return this.waitForAgent(req, 'agent', 'The program needs input. Answer with interactive_respond using one of allowedActions.');
     }
+    // The operator chose to let the agent approve this level of risk. Still validated and audited.
+    if (agentMayApprove(this.approvalMode, req.decision, req.prompt.type)) {
+      return this.waitForAgent(req, 'agent',
+        `Approval delegated to you by the operator (approval mode "${this.approvalMode}"). ${req.decision.risk} risk: ${req.decision.reason} ` +
+        'Answer only if it matches what the user asked for; otherwise CANCEL. Your answer is recorded in the audit log.', true);
+    }
     // Human-only: try the client UI first (elicitation), then the local approval queue.
     this.pending = { req, who: 'human', message: 'Waiting for the human to approve.' };
-    this.notify();
     if (this.askHuman) {
       const { choices } = buildChoices(req, { allowTakeover: false, allowText: false });
-      const r = await this.askHuman(req, choices).catch(() => null);
+      const asked = this.askHuman(req, choices).catch(() => null);
+      // Report "awaiting_human" only once the client is plausibly showing a dialog, so a client that
+      // declines without one goes straight to the fallback below.
+      const settled = await Promise.race([asked.then(() => true), new Promise<false>((r) => setTimeout(() => r(false), UNSHOWN_DIALOG_MS))]);
+      if (!settled) this.notify();
+      const r = await asked;
       if (r) { this.pending = null; return r; }
+    } else {
+      this.notify();
+    }
+    // The client showed no dialog: in "ask-user" mode the agent asks the user in its own UI instead.
+    if (this.approvalMode === 'ask-user') {
+      return this.waitForAgent(req, 'agent',
+        `Human approval required (${req.decision.risk} risk: ${req.decision.reason}). Your client showed no approval dialog, so ASK THE USER NOW ` +
+        'with your own question UI (e.g. AskUserQuestion): show the program\'s question, the options and the risk. Then answer with exactly ' +
+        'the option the user picked, or CANCEL if they decline or do not answer. Never choose for them. Your answer is recorded in the audit log.',
+        true, true);
     }
     this.pending.message = 'Human approval required. Ask the user to run `ttysage approvals` in a terminal to approve or reject, then poll interactive_status.';
     this.notify();
@@ -112,9 +144,9 @@ export class ManagedSession implements HumanChannel {
     return r;
   }
 
-  private waitForAgent(req: InteractionRequest, who: 'agent' | 'human', message: string): Promise<Resolution> {
+  private waitForAgent(req: InteractionRequest, who: 'agent' | 'human', message: string, delegated = false, askUser = false): Promise<Resolution> {
     return new Promise<Resolution>((resolve) => {
-      this.pending = { req, who, message, resolve: (r) => { this.pending = null; resolve(r); } };
+      this.pending = { req, who, message, ...(delegated ? { delegated } : {}), ...(askUser ? { askUser } : {}), resolve: (r) => { this.pending = null; resolve(r); } };
       req.signal.addEventListener('abort', () => { if (this.pending?.req === req) this.pending = null; resolve({ type: 'takeover' }); }, { once: true });
       this.notify();
     });
@@ -172,6 +204,7 @@ export class ManagedSession implements HumanChannel {
     const view: Record<string, unknown> = {
       sessionId: this.session.id,
       status,
+      approvalMode: this.approvalMode,
       command: this.session.command,
       ...(this.result ? { exitCode: this.result.exitCode, durationMs: this.result.durationMs } : {}),
       output: out.length > OUTPUT_LIMIT ? `…[truncated]\n${out.slice(-OUTPUT_LIMIT)}` : out,
@@ -182,6 +215,8 @@ export class ManagedSession implements HumanChannel {
       view.pending = {
         requestId: req.id,
         who: this.pending.who,
+        ...(this.pending.delegated ? { delegatedApproval: true } : {}),
+        ...(this.pending.askUser ? { askUser: true } : {}),
         message: this.pending.message,
         prompt: {
           type: req.prompt.type,
@@ -233,7 +268,7 @@ export class SessionManager {
   readonly audit: AuditLogger;
   private readonly sweeper: NodeJS.Timeout;
 
-  constructor(private readonly askHuman: HumanAsker | null = null) {
+  constructor(private readonly askHuman: HumanAsker | null = null, readonly approvalMode: ApprovalMode = 'human') {
     this.queue = new ApprovalQueue(path.join(ttysageHome(), 'approvals'));
     this.audit = new AuditLogger();
     this.sweeper = setInterval(() => this.sweep(), 60_000);
@@ -241,7 +276,7 @@ export class SessionManager {
   }
 
   start(opts: StartOptions): ManagedSession {
-    const s = new ManagedSession(opts, this.askHuman, this.queue, this.audit);
+    const s = new ManagedSession(opts, this.askHuman, this.queue, this.audit, this.approvalMode);
     this.sessions.set(s.session.id, s);
     return s;
   }

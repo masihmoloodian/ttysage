@@ -2,8 +2,9 @@ import { z } from 'zod';
 import { KEY_NAMES } from '@ttysage/pty';
 import type { PromptModel, SemanticInterpreter, InterpretResult } from '@ttysage/prompt-understanding';
 import {
-  assessRisk, intentMismatch, isDestructive, maxRisk, riskRank, POLICY,
-  type RiskOrUnknown, type RiskSignal,
+  assessChoices, assessRisk, intentForbids, intentMismatch, intentRequests, isDestructive, maxRisk, riskRank, signalRoots,
+  DESTRUCTIVE_CATEGORIES, POLICY,
+  type RiskAssessment, type RiskLevel, type RiskOrUnknown, type RiskSignal,
 } from '@ttysage/safety';
 
 // ---------------------------------------------------------------------------
@@ -130,6 +131,54 @@ interface Draft {
   pendingAuto?: Action;
   /** Preference selection where only an LLM could map intent → option. */
   llmMayChoose?: boolean;
+  /** pendingAuto declines a destructive alternative of a risky prompt (see safeChoice). */
+  safeChoice?: boolean;
+}
+
+/**
+ * Per-choice risk. The question of a schema-sync prompt like
+ *   "Do you want to truncate bank_account table?"  ❯ No, add the constraint without truncating the table
+ *                                                     Yes, truncate the table
+ * is CRITICAL, but the risk lives in one *answer*. TtySage may pick the answer that explicitly declines
+ * the destructive action when ALL of these hold (otherwise the prompt escalates as before):
+ * - single choice, and exactly one option explicitly negates a destructive verb ("without truncating",
+ *   "don't delete") whose remaining words carry no HIGH+ signal, while some other option performs it;
+ * - every destructive signal of the question/context is about a verb that option declines (a generic
+ *   "THIS WILL CAUSE DATA LOSS" or an unrelated "drop column" keeps it human-only);
+ * - nothing else HIGH+ remains (production, credentials, cost, injection...);
+ * - the intent forbids the declined action ("do not truncate"), or the option is the program's own default
+ *   and the intent does not ask for the destructive action.
+ * A choice that performs a destructive action is never selected automatically.
+ */
+function safeChoice(prompt: PromptModel, ctx: DecisionContext, assessment: RiskAssessment): { index: number; risk: RiskLevel; declines: string[] } | null {
+  if (prompt.multiple || prompt.options.length < 2 || prompt.typedText) return null;
+  const choices = assessChoices(prompt.options.map((o) => o.label));
+  const dangerous = choices.filter((c) => c.destructive);
+  if (dangerous.length === 0) return null;
+  const dangerRoots = new Set(dangerous.flatMap((c) => c.performs));
+  const candidates = choices.filter((c) =>
+    !c.destructive && riskRank(c.level) < riskRank('HIGH') && c.declines.length > 0 && c.declines.some((r) => dangerRoots.has(r)));
+  if (candidates.length !== 1) return null;
+  const safe = candidates[0]!;
+  const declined = new Set(safe.declines);
+
+  let residual: RiskLevel = safe.level;
+  for (const s of assessment.signals) {
+    if (s.source === 'option') continue; // judged per choice above
+    if (DESTRUCTIVE_CATEGORIES.includes(s.category) && riskRank(s.level) >= riskRank('HIGH')) {
+      const roots = signalRoots(s);
+      if (roots.length === 0 || !roots.every((r) => declined.has(r))) return null;
+      continue;
+    }
+    if (s.category === 'warning') continue; // "You're about to…" introduces the declined action
+    if (riskRank(s.level) > riskRank(residual)) residual = s.level;
+  }
+  if (riskRank(residual) >= riskRank('HIGH')) return null;
+
+  if (intentRequests(ctx.intent, dangerRoots)) return null;
+  const isDefault = prompt.defaultIndex === safe.index;
+  if (!intentForbids(ctx.intent, declined) && !isDefault) return null;
+  return { index: safe.index, risk: residual, declines: [...declined] };
 }
 
 /** The deterministic policy. Never calls the network. */
@@ -185,7 +234,24 @@ export function decideDeterministic(prompt: PromptModel, ctx: DecisionContext): 
     risk = maxRisk(risk, prompt.type === 'multiline' ? 'LOW' : 'MEDIUM');
     return { decision: base({ decision: 'ASK_HUMAN', kind: askKind(risk), risk, reason: `The program opened a free-form ${prompt.type} interaction; it needs a human (or the agent) to drive it.` }) };
   }
-  // 5. Any consequence signal ⇒ human.
+  // 5. Any consequence signal ⇒ human, unless one answer explicitly declines the consequence.
+  if (assessment.level !== 'LOW' && choiceLike) {
+    const safe = safeChoice(prompt, ctx, assessment);
+    const blocked = (ctx.previousAutoAttempts ?? 0) > 0 || conf < POLICY.autoMinDetectionConfidence || ctx.autoAnswer === false;
+    if (safe && !blocked) {
+      const action: Action = safe.index === prompt.defaultIndex ? { type: 'ACCEPT_DEFAULT' } : { type: 'SELECT_OPTION', optionIndex: safe.index };
+      const label = prompt.options[safe.index]!.label;
+      const why = intentForbids(ctx.intent, safe.declines) ? 'the agent intent forbids it' : 'it is the program\'s own default';
+      return {
+        pendingAuto: action,
+        safeChoice: true,
+        decision: base({
+          decision: 'AUTO', action, answer: label, risk: safe.risk,
+          reason: `${assessment.level} risk only in the alternative answer (${topSignals(assessment.signals)}); selecting "${label}", which declines it, because ${why}.`,
+        }),
+      };
+    }
+  }
   if (assessment.level !== 'LOW') {
     const why = `${mismatch ? 'The prompt implies destructive effects the agent intent did not ask for. ' : ''}Risk signals: ${topSignals(assessment.signals)}.`;
     return { decision: base({ decision: 'ASK_HUMAN', kind: askKind(risk), reason: `${risk} risk. ${why}${risk === 'CRITICAL' ? ' Destructive operations are never auto-approved.' : ''}` }) };
@@ -301,9 +367,12 @@ export async function decide(prompt: PromptModel, ctx: DecisionContext): Promise
   const combinedRisk = maxRisk(d.risk, a.risk);
 
   if (draft.pendingAuto) {
-    const agrees =
-      a.risk === 'LOW' && a.confidence >= POLICY.autoMinLlmConfidence && a.intentAlignment !== 'mismatch' && !a.destructive &&
-      sameAction(draft.pendingAuto, a.recommendedAction, prompt);
+    // For a declining choice the prompt itself is risky by nature: the LLM must recommend the same
+    // declining answer, but its risk/destructive verdict describes the prompt, not that answer.
+    const agrees = draft.safeChoice
+      ? a.confidence >= POLICY.autoMinLlmConfidence && a.intentAlignment !== 'mismatch' && sameAction(draft.pendingAuto, a.recommendedAction, prompt)
+      : a.risk === 'LOW' && a.confidence >= POLICY.autoMinLlmConfidence && a.intentAlignment !== 'mismatch' && !a.destructive &&
+        sameAction(draft.pendingAuto, a.recommendedAction, prompt);
     if (agrees) return { ...d, llm: info };
     return applyAvailability({
       ...d,

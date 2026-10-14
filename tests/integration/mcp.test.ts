@@ -82,10 +82,12 @@ describe('MCP adapter', () => {
   }, 40_000);
 
   it('elicitation: dismissed ⇒ falls back to the queue; declined ⇒ cancel; accepted ⇒ answer', async () => {
-    const mk = async (respond: (labels: string[]) => { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, string> }) => {
+    // `thinkMs`: how long the human looks at the dialog. An instant decline means the client showed no dialog.
+    const mk = async (respond: (labels: string[]) => { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, string> }, thinkMs = 0) => {
       const c = new Client({ name: 'elicit-agent', version: '1.0.0' }, { capabilities: { elicitation: {} } });
       c.setRequestHandler(ElicitRequestSchema, async (req) => {
         const labels = ((req.params as unknown as { requestedSchema: { properties: { choice: { enum: string[] } } } }).requestedSchema.properties.choice.enum);
+        await new Promise((r) => setTimeout(r, thinkMs));
         return respond(labels);
       });
       await c.connect(new StdioClientTransport({ command: path.join(ROOT, 'node_modules/.bin/tsx'), args: [path.join(ROOT, 'apps/mcp/src/main.ts')], env: { ...process.env, TTYSAGE_HOME: home } as Record<string, string>, cwd: FIXTURES }));
@@ -98,7 +100,7 @@ describe('MCP adapter', () => {
     expect(accepted.v.status).toBe('completed');
     expect(accepted.v.output).toContain('APPLIED');
     await accepted.c.close();
-    const declined = await mk(() => ({ action: 'decline' }));
+    const declined = await mk(() => ({ action: 'decline' }), 1600);
     expect(declined.v.status).toBe('completed');
     expect(declined.v.output).not.toContain('APPLIED');
     await declined.c.close();

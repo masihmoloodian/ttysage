@@ -132,6 +132,96 @@ describe('decision engine', () => {
   });
 });
 
+describe('per-choice risk (declining a destructive alternative)', () => {
+  const q = "· You're about to add users_email_uq unique constraint to the table, which contains 4 items. If this statement fails, you will receive an error from the database. Do you want to truncate users table?";
+  const truncate = (opts: string[], sel = 0) => `${A.hide}${q}\n${opts.map((o, i) => `${i === sel ? '❯' : ' '} ${o}`).join('\n')}`;
+  const SAFE = 'No, add the constraint without truncating the table';
+  const DANGER = 'Yes, truncate the table';
+  const push = { command: 'pnpm db:push' };
+
+  it('AUTO: the safe default is accepted when the intent forbids truncation', async () => {
+    const d = await decision(truncate([SAFE, DANGER]), { ...push, intent: 'do not rename; do not drop or truncate data' });
+    expect(d.decision).toBe('AUTO');
+    expect(d.action).toEqual({ type: 'ACCEPT_DEFAULT' });
+    expect(d.answer).toBe(SAFE);
+    expect(d.risk).toBe('MEDIUM'); // "push" in the command; the CRITICAL part belongs to the declined answer
+  });
+
+  it('AUTO: the safe default is accepted without intent (the program\'s own default declines)', async () => {
+    const d = await decision(truncate([SAFE, DANGER]), push);
+    expect(d.decision).toBe('AUTO');
+    expect(d.action).toEqual({ type: 'ACCEPT_DEFAULT' });
+  });
+
+  it('AUTO: a non-default declining choice is selected only when the intent forbids the action', async () => {
+    const forbids = await decision(truncate([DANGER, SAFE]), { ...push, intent: "don't truncate anything" });
+    expect(forbids.decision).toBe('AUTO');
+    expect(forbids.action).toEqual({ type: 'SELECT_OPTION', optionIndex: 1 });
+    const silent = await decision(truncate([DANGER, SAFE]), push);
+    expect(silent.decision).toBe('ASK_HUMAN');
+    expect(silent.risk).toBe('CRITICAL');
+  });
+
+  it('ASK: the intent asks for the destructive action', async () => {
+    const d = await decision(truncate([SAFE, DANGER]), { ...push, intent: 'truncate the users table and add the constraint' });
+    expect(d.decision).toBe('ASK_HUMAN');
+    expect(d.kind).toBe('approval');
+  });
+
+  it('ASK: no declining choice (only the truncate answer moves forward)', async () => {
+    const d = await decision(truncate([DANGER, 'Abort']), { ...push, intent: 'do not truncate data' });
+    expect(d.decision).toBe('ASK_HUMAN');
+    expect(d.risk).toBe('CRITICAL');
+  });
+
+  it('ASK: a generic data-loss statement is not explained by the declined verb', async () => {
+    const d = await decision(`THIS ACTION WILL CAUSE DATA LOSS\n${truncate([SAFE, DANGER])}`, { ...push, intent: 'do not truncate' });
+    expect(d.decision).toBe('ASK_HUMAN');
+  });
+
+  it('ASK: an unrelated destructive consequence (drop column) keeps it human-only', async () => {
+    const d = await decision(`${A.hide}You are about to drop column users.legacy and truncate users.\nContinue?\n❯ ${SAFE}\n  ${DANGER}`, { ...push, intent: 'do not truncate' });
+    expect(d.decision).toBe('ASK_HUMAN');
+  });
+
+  it('ASK: other HIGH risk (production) is not discounted', async () => {
+    const d = await decision(truncate([SAFE, DANGER]), { command: 'deploy-db --env production', intent: 'do not truncate' });
+    expect(d.decision).toBe('ASK_HUMAN');
+  });
+
+  it('ASK: a label whose negation does not govern the destructive verb is not a declining choice', async () => {
+    const d = await decision(truncate(["Don't wait, truncate now", DANGER]), { ...push, intent: 'do not truncate' });
+    expect(d.decision).toBe('ASK_HUMAN');
+  });
+
+  it('LLM must recommend the same declining answer; an adversarial LLM cannot pick the danger choice', async () => {
+    const agree = await decision(truncate([SAFE, DANGER]), { ...push, intent: 'do not truncate', interpreter: fakeLlm({ risk: 'CRITICAL', destructive: true }) });
+    expect(agree.decision).toBe('AUTO');
+    const veto = await decision(truncate([SAFE, DANGER]), { ...push, intent: 'do not truncate', interpreter: fakeLlm({ risk: 'LOW', recommendedAction: { type: 'SELECT_OPTION', optionIndex: 1 } }) });
+    expect(veto.decision).toBe('ASK_HUMAN');
+  });
+
+  it('assessChoices / intent helpers', async () => {
+    const { assessChoices, intentForbids, intentRequests } = await import('@ttysage/safety');
+    const [safe, danger] = assessChoices([SAFE, DANGER]);
+    expect(safe).toMatchObject({ destructive: false, level: 'LOW', declines: ['truncat'] });
+    expect(danger).toMatchObject({ destructive: true, performs: ['truncat'] });
+    expect(intentForbids('do not drop or truncate data', ['truncat'])).toBe(true);
+    expect(intentForbids('truncate it', ['truncat'])).toBe(false);
+    expect(intentRequests('do not drop or truncate data', ['truncat'])).toBe(false);
+    expect(intentRequests('truncate it', ['truncat'])).toBe(true);
+    expect(intentRequests('truncate prompts must be answered No', ['truncat'])).toBe(false);
+    expect(intentRequests('answer the drop table warnings', ['drop'])).toBe(false);
+    expect(intentRequests('truncate the prompts table', ['truncat'])).toBe(true);
+  });
+
+  it('AUTO: an intent that only names the truncate prompts does not ask for truncation', async () => {
+    const d = await decision(truncate([SAFE, DANGER]), { ...push, intent: 'Known plan: re-add existing uniques; truncate prompts must be answered No.' });
+    expect(d.decision).toBe('AUTO');
+    expect(d.action).toEqual({ type: 'ACCEPT_DEFAULT' });
+  });
+});
+
 describe('risk lexicon details', () => {
   it('explicit zero counts are not consequences, other negations still are', async () => {
     const { assessRisk } = await import('@ttysage/safety');

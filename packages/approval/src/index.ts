@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import type { HumanChannel, InteractionRequest, Resolution } from '@ttysage/core';
 import { isAffirmative, isNegative } from '@ttysage/detector';
@@ -278,18 +279,38 @@ export class ApprovalQueue {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
   }
 
+  /**
+   * Live requests only. Entries whose requesting process is gone (killed, crashed: its `finally` never
+   * ran) are removed, as are leftovers nobody can consume any more (orphan responses, stale temp files).
+   */
   list(): QueuedApproval[] {
     if (!fs.existsSync(this.dir)) return [];
     const out: QueuedApproval[] = [];
-    for (const f of fs.readdirSync(this.dir)) {
+    const files = fs.readdirSync(this.dir);
+    for (const f of files) {
       if (!/^[a-z0-9-]+\.json$/.test(f) || f.endsWith('.response.json')) continue;
       try {
         const q = JSON.parse(fs.readFileSync(path.join(this.dir, f), 'utf8')) as QueuedApproval;
-        if (!processAlive(q.pid)) { this.remove(q.id); continue; }
+        if (!requesterAlive(q)) { this.remove(q.id); continue; }
         out.push(q);
       } catch { /* partial write */ }
     }
+    this.sweep(files, new Set(out.map((q) => q.id)));
     return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  private sweep(files: string[], live: Set<string>): void {
+    const now = Date.now();
+    for (const f of files) {
+      const orphanResponse = /^([a-z0-9-]+)\.response\.json$/.exec(f);
+      const stale = f.endsWith('.tmp') || (orphanResponse !== null && !live.has(orphanResponse[1]!));
+      if (!stale) continue;
+      const file = path.join(this.dir, f);
+      try {
+        // Grace period: a writer may be between write and rename, or about to read its response.
+        if (now - fs.statSync(file).mtimeMs > 60_000) fs.rmSync(file, { force: true });
+      } catch { /* raced with another reader */ }
+    }
   }
 
   get(id: string): QueuedApproval | null {
@@ -330,6 +351,30 @@ export class ApprovalQueue {
 
 function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+/** Start time of a running process, or null when unknown (no `ps`, or the process is gone). */
+function processStartedAt(pid: number): number | null {
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }).trim();
+    const t = out ? Date.parse(out) : NaN;
+    return Number.isNaN(t) ? null : t;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The requester is still waiting: its pid is alive AND is the same process (a pid recycled by a newer
+ * process — started after the entry was queued — does not keep a dead request alive).
+ */
+export function requesterAlive(q: Pick<QueuedApproval, 'pid' | 'createdAt'>): boolean {
+  if (!Number.isInteger(q.pid) || q.pid <= 0 || !processAlive(q.pid)) return false;
+  if (q.pid === process.pid) return true;
+  const started = processStartedAt(q.pid);
+  const created = Date.parse(q.createdAt);
+  // lstart has 1s resolution: allow a small margin.
+  return started === null || Number.isNaN(created) || started <= created + 1000;
 }
 
 export interface QueueChannelOptions {
